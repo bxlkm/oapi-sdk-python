@@ -28,11 +28,14 @@ from lark_oapi.ws.model import *
 from lark_oapi.ws.pb.google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 from lark_oapi.ws.pb.pbbp2_pb2 import Frame
 
-try:
-    loop = asyncio.get_event_loop()
-except RuntimeError:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+
+def _get_loop():
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
 
 def _get_by_key(headers: RepeatedCompositeFieldContainer, key: str) -> str:
@@ -151,7 +154,7 @@ class Client(object):
         self._reconnect_interval: int = 120
         self._ping_interval: int = 120
         self._cache: ExpiringCache = ExpiringCache(clear_interval=30)
-        self._lock = asyncio.Lock()
+        self._lock = None
         # Observer hooks for higher-level wrappers (e.g. FeishuChannel) to
         # react to reconnect lifecycle. ``on_reconnecting`` fires when the
         # client decides a connection was lost and starts retrying;
@@ -162,21 +165,22 @@ class Client(object):
         logger.setLevel(log_level.value)
 
     def start(self) -> None:
+        _l = _get_loop()
         try:
-            loop.run_until_complete(self._connect())
+            _l.run_until_complete(self._connect())
         except ClientException as e:
             logger.error(self._fmt_log("connect failed, err: {}", e))
             raise e
         except Exception as e:
             logger.error(self._fmt_log("connect failed, err: {}", e))
-            loop.run_until_complete(self._disconnect())
+            _l.run_until_complete(self._disconnect())
             if self._auto_reconnect:
-                loop.run_until_complete(self._reconnect())
+                _l.run_until_complete(self._reconnect())
             else:
                 raise e
 
-        loop.create_task(self._ping_loop())
-        loop.run_until_complete(_select())
+        _l.create_task(self._ping_loop())
+        _l.run_until_complete(_select())
 
     async def _ping_loop(self):
         while True:
@@ -191,6 +195,8 @@ class Client(object):
                 await asyncio.sleep(self._ping_interval)
 
     async def _connect(self) -> None:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         await self._lock.acquire()
         if self._conn is not None:
             return
@@ -208,7 +214,7 @@ class Client(object):
             self._service_id = service_id
 
             logger.info(self._fmt_log("connected to {}", conn_url))
-            loop.create_task(self._receive_message_loop())
+            asyncio.get_event_loop().create_task(self._receive_message_loop())
         except InvalidHandshake as e:
             _parse_ws_conn_exception(e)
         finally:
@@ -220,7 +226,7 @@ class Client(object):
                 if self._conn is None:
                     raise ConnectionClosedException("connection is closed")
                 msg = await self._conn.recv()
-                loop.create_task(self._handle_message(msg))
+                asyncio.get_event_loop().create_task(self._handle_message(msg))
         except Exception as e:
             logger.error(self._fmt_log("receive message loop exit, err: {}", e))
             await self._disconnect()
